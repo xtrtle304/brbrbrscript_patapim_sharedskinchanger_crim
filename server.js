@@ -11,7 +11,6 @@ const wss = new WebSocket.Server({ port: 3000 });
   serverId,
   userId,
   skins: []
-}
 */
 let clients = [];
 
