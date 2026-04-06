@@ -1,16 +1,20 @@
 {
   "name": "roblox-skin-sync-server",
-  "version": "1.0.0",
-  "description": "WebSocket skin synchronization server for Roblox",
+  "version": "2.0.0",
+  "description": "WebSocket-based skin sync server for Roblox",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "nodemon server.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "express": "^4.19.2",
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
 }
