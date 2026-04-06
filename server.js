@@ -1,336 +1,262 @@
-const express    = require("express");
-const http       = require("http");
-const { WebSocketServer, WebSocket } = require("ws");
+// ─────────────────────────────────────────────────────────────────────────────
+//  SkinSync — Railway WebSocket Server
+//  node server.js
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
-const app    = express();
-const server = http.createServer(app);
-const wss    = new WebSocketServer({ server, path: "/ws" });
+const WebSocket = require("ws");
+const http      = require("http");
 
-app.use(express.json());
+const PORT = process.env.PORT || 8080;
 
-const PORT    = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || "changeme_secret_key";
+// ─── In-memory state ──────────────────────────────────────────────────────────
+//
+//  servers   Map<serverId, ServerEntry>
+//
+//  ServerEntry {
+//    ws      : WebSocket
+//    players : Map<userId, PlayerEntry>
+//  }
+//
+//  PlayerEntry {
+//    name  : string
+//    skins : string[]   // index → SkinName
+//  }
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─── State ────────────────────────────────────────────────────────────────────
-// servers[instanceId] = {
-//   players: { userId: { name, skins[], joinedAt, lastSeen } }
-// }
-const servers = {};
+/** @type {Map<string, { ws: WebSocket, players: Map<string, { name: string, skins: string[] }> }>} */
+const servers = new Map();
 
-// Long-poll queues per instanceId: Map<instanceId, Set<(events) => void>>
-const longPollQueues = new Map();
+// ─── Utility ──────────────────────────────────────────────────────────────────
 
-// WebSocket subscriptions per instanceId: Map<instanceId, Set<ws>>
-const wsSubscriptions = new Map();
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function ensureServer(instanceId) {
-  if (!servers[instanceId]) servers[instanceId] = { players: {} };
-  return servers[instanceId];
+function ts() {
+  return new Date().toISOString();
 }
 
-function getServerPlayers(instanceId) {
-  const srv = servers[instanceId];
-  if (!srv) return [];
-  return Object.entries(srv.players).map(([userId, d]) => ({
-    userId, name: d.name, skins: d.skins, joinedAt: d.joinedAt,
-  }));
+function log(tag, ...args) {
+  console.log(`[${ts()}] [${tag}]`, ...args);
 }
 
-// Stale player pruning (60 s without heartbeat)
-setInterval(() => {
-  const STALE = 60_000;
-  const now   = Date.now();
-  for (const [id, srv] of Object.entries(servers)) {
-    for (const [uid, p] of Object.entries(srv.players)) {
-      if (now - p.lastSeen > STALE) {
-        console.log(`[prune] ${p.name} (${uid}) from ${id}`);
-        delete srv.players[uid];
-        pushEvent(id, { type: "PlayerLeft", userId: uid });
-      }
-    }
-    if (!Object.keys(srv.players).length) {
-      delete servers[id];
-      console.log(`[prune] server ${id} empty - removed`);
-    }
-  }
-}, 30_000);
-
-// ─── Event Bus ────────────────────────────────────────────────────────────────
-// Pushes an event to:
-//   1. All WebSocket clients subscribed to instanceId
-//   2. All hanging long-poll requests for instanceId
-function pushEvent(instanceId, event) {
-  const payload = JSON.stringify({ instanceId, ...event });
-
-  // WebSocket subscribers
-  const wsSubs = wsSubscriptions.get(instanceId);
-  if (wsSubs) {
-    for (const ws of wsSubs) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-    }
-  }
-
-  // Long-poll resolvers - resolve immediately, client reconnects for next event
-  const lpQueue = longPollQueues.get(instanceId);
-  if (lpQueue && lpQueue.size > 0) {
-    for (const resolve of lpQueue) resolve([event]);
-    lpQueue.clear();
+/** Safe JSON send */
+function send(ws, payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
   }
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-function authHttp(req, res, next) {
-  if (req.headers["x-api-key"] !== API_KEY)
-    return res.status(401).json({ success: false, error: "Unauthorized" });
-  next();
+/**
+ * Broadcast to every registered server.
+ * @param {object}  payload
+ * @param {string=} excludeServerId  — skip this server
+ */
+function broadcast(payload, excludeServerId = null) {
+  for (const [sid, srv] of servers) {
+    if (sid !== excludeServerId) {
+      send(srv.ws, payload);
+    }
+  }
 }
 
-// ─── WebSocket Server ─────────────────────────────────────────────────────────
-// Protocol (JSON messages):
-//   Client -> Server:
-//     { type: "auth",        key: string }
-//     { type: "subscribe",   instanceId: string }
-//     { type: "unsubscribe", instanceId: string }
-//     { type: "ping" }
-//   Server -> Client:
-//     { type: "authOk" | "authFail" }
-//     { type: "subscribed", instanceId }
-//     { type: "pong" }
-//     { instanceId, type: "PlayerJoined" | "PlayerLeft" | "SkinsUpdated" | "InitialSync", ...data }
+/** Flatten all players across all servers into a plain array */
+function allPlayersSnapshot() {
+  const list = [];
+  for (const [sid, srv] of servers) {
+    for (const [uid, p] of srv.players) {
+      list.push({ serverId: sid, userId: uid, name: p.name, skins: p.skins });
+    }
+  }
+  return list;
+}
+
+/** Build telemetry object */
+function buildTelemetry() {
+  const perServer = {};
+  let total = 0;
+  for (const [sid, srv] of servers) {
+    perServer[sid] = srv.players.size;
+    total += srv.players.size;
+  }
+  return {
+    serverCount  : servers.size,
+    totalPlayers : total,
+    perServer,
+    timestamp    : Date.now(),
+  };
+}
+
+// ─── HTTP server  (REST telemetry endpoint) ───────────────────────────────────
+
+const httpServer = http.createServer((req, res) => {
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  // GET /telemetry
+  if (req.method === "GET" && req.url === "/telemetry") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, ...buildTelemetry() }, null, 2));
+    return;
+  }
+
+  // GET /health
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, uptime: process.uptime() }));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ ok: false, error: "not found" }));
+});
+
+// ─── WebSocket server ─────────────────────────────────────────────────────────
+
+const wss = new WebSocket.Server({ server: httpServer });
+
 wss.on("connection", (ws, req) => {
-  ws.isAuthed     = false;
-  ws.subscribedTo = new Set();
+  // Client passes its serverId as a query param:
+  //   wss://your-app.railway.app?serverId=PlaceId_JobId
+  const url      = new URL(req.url, "http://localhost");
+  const serverId = url.searchParams.get("serverId") || `srv_${Date.now()}`;
 
-  console.log(`[ws] new connection from ${req.socket.remoteAddress}`);
+  log("CONNECT", `serverId=${serverId}`);
 
+  // Register server slot
+  servers.set(serverId, { ws, players: new Map() });
+
+  // ── Tell the newcomer: "here's everyone currently online everywhere" ─────────
+  send(ws, {
+    type    : "WELCOME",
+    serverId,
+    players : allPlayersSnapshot(),   // all OTHER servers' players
+  });
+
+  // ── Message dispatcher ───────────────────────────────────────────────────────
   ws.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return ws.close(1003, "bad json"); }
+    try { msg = JSON.parse(raw); }
+    catch { send(ws, { type: "ERROR", error: "invalid JSON" }); return; }
 
-    // ── Auth ──
-    if (msg.type === "auth") {
-      if (msg.key === API_KEY) {
-        ws.isAuthed = true;
-        ws.send(JSON.stringify({ type: "authOk" }));
-        console.log("[ws] client authenticated");
-      } else {
-        ws.send(JSON.stringify({ type: "authFail" }));
-        ws.close(1008, "unauthorized");
+    const srv = servers.get(serverId);
+    if (!srv) return;
+
+    switch (msg.type) {
+
+      // ── Bulk announce: "here are all players currently on my server" ─────────
+      // Sent once right after connection, from the Luau script's initial sweep.
+      case "ANNOUNCE_PLAYERS": {
+        // msg.players: Array<{ userId, name, skins }>
+        if (!Array.isArray(msg.players)) {
+          send(ws, { type: "ERROR", error: "ANNOUNCE_PLAYERS.players must be an array" });
+          return;
+        }
+        for (const p of msg.players) {
+          if (!p.userId || !p.name || !Array.isArray(p.skins)) continue;
+          srv.players.set(String(p.userId), { name: p.name, skins: p.skins });
+        }
+        log("ANNOUNCE_PLAYERS", `server=${serverId} count=${msg.players.length}`);
+
+        // Let every other server know about this server's full roster
+        broadcast({
+          type     : "PLAYERS_ANNOUNCED",
+          serverId ,
+          players  : msg.players,
+        }, serverId);
+
+        send(ws, { type: "ANNOUNCE_ACK", count: msg.players.length });
+        break;
       }
-      return;
+
+      // ── A single player joined ───────────────────────────────────────────────
+      // msg: { userId, name, skins[] }
+      case "PLAYER_JOIN": {
+        const { userId, name, skins } = msg;
+        if (!userId || !name || !Array.isArray(skins)) {
+          send(ws, { type: "ERROR", error: "PLAYER_JOIN: userId, name, skins[] required" });
+          return;
+        }
+        srv.players.set(String(userId), { name, skins });
+        log("PLAYER_JOIN", `server=${serverId}  ${userId}(${name})  skins=${skins.length}`);
+
+        // Tell every other server
+        broadcast({ type: "PLAYER_JOINED", serverId, userId, name, skins }, serverId);
+
+        // Confirm to origin + send fresh global roster
+        send(ws, { type: "PLAYER_JOIN_ACK", userId });
+        send(ws, { type: "ROSTER_SYNC", players: allPlayersSnapshot() });
+        break;
+      }
+
+      // ── A player left ────────────────────────────────────────────────────────
+      // msg: { userId }
+      case "PLAYER_LEAVE": {
+        const { userId } = msg;
+        const player = srv.players.get(String(userId));
+        if (!player) { send(ws, { type: "ERROR", error: "unknown userId" }); return; }
+
+        srv.players.delete(String(userId));
+        log("PLAYER_LEAVE", `server=${serverId}  ${userId}(${player.name})`);
+
+        broadcast({ type: "PLAYER_LEFT", serverId, userId, name: player.name }, serverId);
+        break;
+      }
+
+      // ── Player updated their skins ───────────────────────────────────────────
+      // msg: { userId, skins[] }
+      case "UPDATE_SKINS": {
+        const { userId, skins } = msg;
+        const player = srv.players.get(String(userId));
+        if (!player || !Array.isArray(skins)) {
+          send(ws, { type: "ERROR", error: "UPDATE_SKINS: unknown userId or invalid skins" });
+          return;
+        }
+        player.skins = skins;
+        log("UPDATE_SKINS", `server=${serverId}  ${userId}  skins=${skins.length}`);
+
+        broadcast({ type: "SKINS_UPDATED", serverId, userId, name: player.name, skins }, serverId);
+        send(ws, { type: "UPDATE_SKINS_ACK", userId, skins });
+        break;
+      }
+
+      // ── Telemetry over WebSocket ─────────────────────────────────────────────
+      case "GET_TELEMETRY": {
+        send(ws, { type: "TELEMETRY", ...buildTelemetry() });
+        break;
+      }
+
+      // ── Keepalive ────────────────────────────────────────────────────────────
+      case "PING": {
+        send(ws, { type: "PONG", ts: Date.now() });
+        break;
+      }
+
+      default:
+        send(ws, { type: "ERROR", error: `unknown type: ${msg.type}` });
     }
-
-    if (!ws.isAuthed) return ws.close(1008, "not authenticated");
-
-    // ── Subscribe ──
-    if (msg.type === "subscribe" && msg.instanceId) {
-      if (!wsSubscriptions.has(msg.instanceId))
-        wsSubscriptions.set(msg.instanceId, new Set());
-      wsSubscriptions.get(msg.instanceId).add(ws);
-      ws.subscribedTo.add(msg.instanceId);
-
-      // Send current state immediately
-      ws.send(JSON.stringify({
-        type:       "InitialSync",
-        instanceId: msg.instanceId,
-        players:    getServerPlayers(msg.instanceId),
-      }));
-      ws.send(JSON.stringify({ type: "subscribed", instanceId: msg.instanceId }));
-    }
-
-    // ── Unsubscribe ──
-    if (msg.type === "unsubscribe" && msg.instanceId) {
-      wsSubscriptions.get(msg.instanceId)?.delete(ws);
-      ws.subscribedTo.delete(msg.instanceId);
-    }
-
-    // ── Ping/Pong ──
-    if (msg.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
   });
 
+  // ── Clean up when this game server disconnects ───────────────────────────────
   ws.on("close", () => {
-    for (const id of ws.subscribedTo) wsSubscriptions.get(id)?.delete(ws);
-    console.log("[ws] client disconnected");
-  });
+    const srv = servers.get(serverId);
+    if (!srv) return;
 
-  // Server-side keepalive ping every 30 s
-  const keepalive = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) ws.ping();
-    else clearInterval(keepalive);
-  }, 30_000);
-});
+    log("DISCONNECT", `serverId=${serverId}  players=${srv.players.size}`);
 
-// ─── HTTP Routes (used by Roblox — no native WS support) ─────────────────────
-
-// POST /api/join
-// Body: { userId, playerName, serverInstanceId, skins[] }
-// Returns: { success, players[] } — players already on this instance
-app.post("/api/join", authHttp, (req, res) => {
-  const { userId, playerName, serverInstanceId, skins } = req.body;
-  if (!userId || !playerName || !serverInstanceId)
-    return res.status(400).json({ success: false, error: "Missing fields" });
-
-  const srv = ensureServer(serverInstanceId);
-  const uid = String(userId);
-  const now = Date.now();
-
-  const existingPlayers = getServerPlayers(serverInstanceId).filter(p => p.userId !== uid);
-
-  srv.players[uid] = {
-    name:     playerName,
-    skins:    Array.isArray(skins) ? skins : [],
-    joinedAt: now,
-    lastSeen: now,
-  };
-
-  console.log(`[join] ${playerName} (${uid}) -> ${serverInstanceId}`);
-
-  // Broadcast via WebSocket and unblock long-poll clients
-  pushEvent(serverInstanceId, {
-    type:       "PlayerJoined",
-    userId:     uid,
-    playerName: playerName,
-    skins:      srv.players[uid].skins,
-  });
-
-  res.json({ success: true, players: existingPlayers });
-});
-
-// POST /api/leave
-// Body: { userId, serverInstanceId }
-app.post("/api/leave", authHttp, (req, res) => {
-  const { userId, serverInstanceId } = req.body;
-  if (!userId || !serverInstanceId)
-    return res.status(400).json({ success: false, error: "Missing fields" });
-
-  const uid = String(userId);
-  const srv = servers[serverInstanceId];
-  if (srv) {
-    const name = srv.players[uid]?.name ?? "unknown";
-    delete srv.players[uid];
-    console.log(`[leave] ${name} (${uid}) <- ${serverInstanceId}`);
-
-    pushEvent(serverInstanceId, { type: "PlayerLeft", userId: uid });
-
-    if (!Object.keys(srv.players).length) {
-      delete servers[serverInstanceId];
-      console.log(`[server] ${serverInstanceId} removed (empty)`);
+    // Notify remaining servers
+    for (const [uid, p] of srv.players) {
+      broadcast(
+        { type: "PLAYER_LEFT", serverId, userId: uid, name: p.name, reason: "server_closed" },
+        serverId,
+      );
     }
-  }
-
-  res.json({ success: true });
-});
-
-// PUT /api/skins
-// Body: { userId, serverInstanceId, skins[] }
-app.put("/api/skins", authHttp, (req, res) => {
-  const { userId, serverInstanceId, skins } = req.body;
-  if (!userId || !serverInstanceId || !Array.isArray(skins))
-    return res.status(400).json({ success: false, error: "Missing fields" });
-
-  const player = servers[serverInstanceId]?.players[String(userId)];
-  if (!player)
-    return res.status(404).json({ success: false, error: "Player not found" });
-
-  player.skins    = skins;
-  player.lastSeen = Date.now();
-  console.log(`[skins] ${player.name} updated on ${serverInstanceId}`);
-
-  pushEvent(serverInstanceId, {
-    type:   "SkinsUpdated",
-    userId: String(userId),
-    skins,
+    servers.delete(serverId);
   });
 
-  res.json({ success: true });
+  ws.on("error", (err) => log("WS_ERR", `server=${serverId}`, err.message));
 });
-
-// POST /api/heartbeat
-// Body: { userId, serverInstanceId }
-app.post("/api/heartbeat", authHttp, (req, res) => {
-  const player = servers[req.body.serverInstanceId]?.players[String(req.body.userId)];
-  if (player) player.lastSeen = Date.now();
-  res.json({ success: true });
-});
-
-// GET /api/events/:instanceId?timeout=25
-//
-// HTTP long-poll — Roblox equivalent of a WebSocket subscription.
-// Hangs open until an event is pushed OR timeout expires.
-// Returns: { success, events: [...] }
-// Empty events array means timeout; client should reconnect immediately.
-app.get("/api/events/:instanceId", authHttp, (req, res) => {
-  const { instanceId } = req.params;
-  const timeout = Math.min(parseInt(req.query.timeout) || 25, 28) * 1000;
-
-  if (!longPollQueues.has(instanceId))
-    longPollQueues.set(instanceId, new Set());
-
-  let resolved = false;
-
-  const resolve = (events) => {
-    if (resolved) return;
-    resolved = true;
-    clearTimeout(timer);
-    longPollQueues.get(instanceId)?.delete(resolve);
-    res.json({ success: true, events });
-  };
-
-  const timer = setTimeout(() => resolve([]), timeout);
-  longPollQueues.get(instanceId).add(resolve);
-
-  req.on("close", () => {
-    resolved = true;
-    clearTimeout(timer);
-    longPollQueues.get(instanceId)?.delete(resolve);
-  });
-});
-
-// GET /api/server/:instanceId/players — snapshot (no hanging)
-app.get("/api/server/:instanceId/players", authHttp, (req, res) => {
-  res.json({ success: true, players: getServerPlayers(req.params.instanceId) });
-});
-
-// GET /api/telemetry
-app.get("/api/telemetry", authHttp, (req, res) => {
-  let totalPlayers = 0;
-  const serverStats = {};
-
-  for (const [id, srv] of Object.entries(servers)) {
-    const count = Object.keys(srv.players).length;
-    totalPlayers += count;
-    serverStats[id] = {
-      playerCount:  count,
-      wsSubscribers: wsSubscriptions.get(id)?.size ?? 0,
-      longPollWaiters: longPollQueues.get(id)?.size ?? 0,
-      players: Object.entries(srv.players).map(([uid, d]) => ({
-        userId: uid, name: d.name,
-        joinedAt: d.joinedAt, lastSeen: d.lastSeen, skinCount: d.skins.length,
-      })),
-    };
-  }
-
-  res.json({
-    success:      true,
-    totalPlayers,
-    totalServers: Object.keys(servers).length,
-    wsClients:    wss.clients.size,
-    servers:      serverStats,
-    timestamp:    new Date().toISOString(),
-    uptimeSeconds: Math.floor(process.uptime()),
-  });
-});
-
-// GET /health (no auth)
-app.get("/health", (_req, res) =>
-  res.json({ status: "ok", uptime: process.uptime() })
-);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-server.listen(PORT, () => {
-  console.log(`SkinSync server on port ${PORT}`);
-  console.log(`  HTTP API : http://localhost:${PORT}/api/`);
-  console.log(`  WebSocket: ws://localhost:${PORT}/ws`);
+
+httpServer.listen(PORT, () => {
+  log("READY", `Port=${PORT}`);
+  log("READY", `WS  → ws://host:${PORT}?serverId=<id>`);
+  log("READY", `API → GET /telemetry`);
 });
