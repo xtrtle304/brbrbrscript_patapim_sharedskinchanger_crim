@@ -2,38 +2,57 @@ const WebSocket = require("ws");
 const express = require("express");
 
 const app = express();
-const wss = new WebSocket.Server({ port: 3000 });
+
+// ✅ Railway порт
+const PORT = process.env.PORT || 3000;
+
+// HTTP сервер
+const server = app.listen(PORT, () => {
+  console.log("HTTP + WS server running on port", PORT);
+});
+
+// WebSocket сервер через HTTP
+const wss = new WebSocket.Server({ server });
 
 /*
-Структура:
+Структура клиента:
 {
   ws,
   serverId,
   userId,
   skins: []
+}
 */
 let clients = [];
 
+// 📡 Бродкаст по серверу
 function broadcastToServer(serverId, data, excludeWs = null) {
   clients.forEach(client => {
     if (client.serverId === serverId && client.ws !== excludeWs) {
-      client.ws.send(JSON.stringify(data));
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify(data));
+      }
     }
   });
 }
 
+// 🔌 WebSocket подключение
 wss.on("connection", (ws) => {
+  console.log("New WS connection");
+
   let clientData = null;
 
   ws.on("message", (msg) => {
     let data;
+
     try {
       data = JSON.parse(msg);
-    } catch {
+    } catch (e) {
+      console.log("Invalid JSON");
       return;
     }
 
-    // 🔹 Регистрация игрока
+    // 🔹 Регистрация
     if (data.type === "register") {
       clientData = {
         ws,
@@ -44,7 +63,9 @@ wss.on("connection", (ws) => {
 
       clients.push(clientData);
 
-      // Отправляем текущих игроков сервера новому
+      console.log(`Player ${data.userId} joined server ${data.serverId}`);
+
+      // 📤 Отправляем список игроков на сервере
       const players = clients
         .filter(c => c.serverId === data.serverId)
         .map(c => ({
@@ -57,7 +78,7 @@ wss.on("connection", (ws) => {
         players
       }));
 
-      // Бродкаст входа
+      // 📡 Бродкаст входа
       broadcastToServer(data.serverId, {
         type: "player_join",
         userId: data.userId,
@@ -75,9 +96,16 @@ wss.on("connection", (ws) => {
         skins: data.skins
       }, ws);
     }
+
+    // 🔹 Pong (keep-alive)
+    if (data.type === "pong") {
+      ws.isAlive = true;
+    }
   });
 
   ws.on("close", () => {
+    console.log("WS disconnected");
+
     if (!clientData) return;
 
     clients = clients.filter(c => c.ws !== ws);
@@ -87,7 +115,26 @@ wss.on("connection", (ws) => {
       userId: clientData.userId
     });
   });
+
+  ws.on("error", (err) => {
+    console.error("WS ERROR:", err);
+  });
+
+  ws.isAlive = true;
 });
+
+// ❤️ Ping система (чтобы Railway не убивал соединение)
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+
+    try {
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch (e) {
+      console.log("Ping error:", e);
+    }
+  });
+}, 20000);
 
 // 📊 Телеметрия
 app.get("/telemetry", (req, res) => {
@@ -104,6 +151,7 @@ app.get("/telemetry", (req, res) => {
   });
 });
 
-app.listen(8080, () => {
-  console.log("HTTP telemetry on 8080");
+// 🧨 Ловим краши
+process.on("uncaughtException", (err) => {
+  console.error("CRASH:", err);
 });
