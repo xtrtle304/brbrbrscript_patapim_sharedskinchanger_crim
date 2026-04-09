@@ -87,6 +87,9 @@ wss.on("connection", (ws) => {
     }
 
     // 🔹 Обновление скинов
+    if (data.type == "update_skins") {
+        console.log(`update_skins: ${clientData.userId}`)
+    }
     if (data.type === "update_skins" && clientData) {
       clientData.skins = data.skins;
 
